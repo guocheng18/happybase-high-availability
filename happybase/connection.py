@@ -6,6 +6,8 @@ HappyBase connection module.
 
 import logging
 import socket
+import threading
+import time
 
 import six
 from thriftpy2.protocol import TBinaryProtocol, TCompactProtocol
@@ -205,6 +207,10 @@ class Connection(object):
         self._protocol_class = THRIFT_PROTOCOLS[protocol]
         self._refresh_thrift_client()
 
+        self.recovery_thread = threading.Thread(
+            target=self._recover_failed_connections, daemon=True
+        )
+
         if autoconnect:
             self.open()
 
@@ -236,6 +242,27 @@ class Connection(object):
             return name
         return self.table_prefix + self.table_prefix_separator + name
 
+    def _recover_failed_connections(self, delay=60):
+        """ Try to reopen failed connections every specified seconds """
+        while True:
+            for subconn in self.subconnections:
+                if subconn.status == 0:
+                    try:
+                        subconn.transport.open()
+                        subconn.status = 1
+                        logger.debug(
+                            "Connection to %s:%d recovered",
+                            subconn.server["host"],
+                            subconn.server["port"],
+                        )
+                    except (TException, socket.error):
+                        logger.debug(
+                            "Recover connection to %s:%d failed",
+                            subconn.server["host"],
+                            subconn.server["port"],
+                        )
+            time.sleep(delay)
+
     def open(self):
         """Open the underlying transport to the HBase instance.
 
@@ -260,6 +287,10 @@ class Connection(object):
 
         if sum([subconn.status for subconn in self.subconnections]) == 0:
             raise Exception("Failed to connect to any of thrift servers")
+
+        # Recovery
+        if not self.recovery_thread.is_alive():
+            self.recovery_thread.start()
 
     def close(self):
         """Close the underyling transport to the HBase instance.
