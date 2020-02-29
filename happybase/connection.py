@@ -5,13 +5,14 @@ HappyBase connection module.
 """
 
 import logging
+import socket
 
 import six
-from thriftpy2.thrift import TClient
-from thriftpy2.transport import TBufferedTransport, TFramedTransport, TSocket
 from thriftpy2.protocol import TBinaryProtocol, TCompactProtocol
+from thriftpy2.thrift import TClient, TException
+from thriftpy2.transport import TBufferedTransport, TFramedTransport, TSocket
 
-from Hbase_thrift import Hbase, ColumnDescriptor
+from Hbase_thrift import ColumnDescriptor, Hbase
 
 from .table import Table
 from .util import ensure_bytes, pep8_to_camel_case
@@ -20,21 +21,63 @@ logger = logging.getLogger(__name__)
 
 STRING_OR_BINARY = (six.binary_type, six.text_type)
 
-COMPAT_MODES = ('0.90', '0.92', '0.94', '0.96', '0.98')
-THRIFT_TRANSPORTS = dict(
-    buffered=TBufferedTransport,
-    framed=TFramedTransport,
-)
-THRIFT_PROTOCOLS = dict(
-    binary=TBinaryProtocol,
-    compact=TCompactProtocol,
-)
+COMPAT_MODES = ("0.90", "0.92", "0.94", "0.96", "0.98")
+THRIFT_TRANSPORTS = dict(buffered=TBufferedTransport, framed=TFramedTransport,)
+THRIFT_PROTOCOLS = dict(binary=TBinaryProtocol, compact=TCompactProtocol,)
 
-DEFAULT_HOST = 'localhost'
+DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9090
-DEFAULT_TRANSPORT = 'buffered'
-DEFAULT_COMPAT = '0.98'
-DEFAULT_PROTOCOL = 'binary'
+DEFAULT_TRANSPORT = "buffered"
+DEFAULT_COMPAT = "0.98"
+DEFAULT_PROTOCOL = "binary"
+
+
+class HAClient(object):
+    """ Thrift client with high availability """
+
+    def __init__(self, subconnections):
+        self.subconnections = subconnections
+        self.id = 0
+
+    def __getattr__(self, _api):
+        def _api_func(*args, **kwargs):
+            fails = 0
+            failed = True
+            while failed:
+                if self.subconnections[self.id].status:
+                    result = None
+                    try:
+                        result = getattr(self.subconnections[self.id].client, _api)(
+                            *args, **kwargs
+                        )
+                        failed = False
+                    except (TException, socket.error):
+                        logger.debug(
+                            "Send request to %s:%d failed, trying other servers",
+                            self.subconnections[self.id].server["host"],
+                            self.subconnections[self.id].server["port"],
+                        )
+                        self.subconnections[self.id].transport.close()
+                        self.subconnections[self.id].status = 0
+
+                self.id = (self.id + 1) % len(self.subconnections)
+                if failed:
+                    fails += 1
+                    if fails == len(self.subconnections):
+                        raise Exception("Request to all thrift servers failed!")
+            return result
+
+        return _api_func
+
+
+class Subconnection(object):
+    """ Maintains information about a specific connection"""
+
+    def __init__(self, server, transport, client, status):
+        self.server = server
+        self.transport = transport
+        self.client = client
+        self.status = status
 
 
 class Connection(object):
@@ -98,6 +141,8 @@ class Connection(object):
 
     :param str host: The host to connect to
     :param int port: The port to connect to
+    :param list servers: All thrift servers to enable HA, this will ignore 
+        the host and port params (optional)
     :param int timeout: The socket timeout in milliseconds (optional)
     :param bool autoconnect: Whether the connection should be opened directly
     :param str table_prefix: Prefix used to construct table names (optional)
@@ -105,14 +150,25 @@ class Connection(object):
     :param str compat: Compatibility mode (optional)
     :param str transport: Thrift transport mode (optional)
     """
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=None,
-                 autoconnect=True, table_prefix=None,
-                 table_prefix_separator=b'_', compat=DEFAULT_COMPAT,
-                 transport=DEFAULT_TRANSPORT, protocol=DEFAULT_PROTOCOL):
+
+    def __init__(
+        self,
+        host=DEFAULT_HOST,
+        port=DEFAULT_PORT,
+        servers=None,
+        timeout=None,
+        autoconnect=True,
+        table_prefix=None,
+        table_prefix_separator=b"_",
+        compat=DEFAULT_COMPAT,
+        transport=DEFAULT_TRANSPORT,
+        protocol=DEFAULT_PROTOCOL,
+    ):
 
         if transport not in THRIFT_TRANSPORTS:
-            raise ValueError("'transport' must be one of %s"
-                             % ", ".join(THRIFT_TRANSPORTS.keys()))
+            raise ValueError(
+                "'transport' must be one of %s" % ", ".join(THRIFT_TRANSPORTS.keys())
+            )
 
         if table_prefix is not None:
             if not isinstance(table_prefix, STRING_OR_BINARY):
@@ -124,17 +180,22 @@ class Connection(object):
         table_prefix_separator = ensure_bytes(table_prefix_separator)
 
         if compat not in COMPAT_MODES:
-            raise ValueError("'compat' must be one of %s"
-                             % ", ".join(COMPAT_MODES))
+            raise ValueError("'compat' must be one of %s" % ", ".join(COMPAT_MODES))
 
         if protocol not in THRIFT_PROTOCOLS:
-            raise ValueError("'protocol' must be one of %s"
-                             % ", ".join(THRIFT_PROTOCOLS))
+            raise ValueError(
+                "'protocol' must be one of %s" % ", ".join(THRIFT_PROTOCOLS)
+            )
 
         # Allow host and port to be None, which may be easier for
         # applications wrapping a Connection instance.
-        self.host = host or DEFAULT_HOST
-        self.port = port or DEFAULT_PORT
+        if servers is None:
+            self.servers = [
+                {"host": host or DEFAULT_HOST, "port": port or DEFAULT_PORT}
+            ]
+        else:
+            self.servers = servers
+
         self.timeout = timeout
         self.table_prefix = table_prefix
         self.table_prefix_separator = table_prefix_separator
@@ -150,12 +211,23 @@ class Connection(object):
         self._initialized = True
 
     def _refresh_thrift_client(self):
-        """Refresh the Thrift socket, transport, and client."""
-        socket = TSocket(host=self.host, port=self.port, socket_timeout=self.timeout)
+        """Refresh the Thrift sockets, transports, and clients."""
+        self.subconnections = []
 
-        self.transport = self._transport_class(socket)
-        protocol = self._protocol_class(self.transport, decode_response=False)
-        self.client = TClient(Hbase, protocol)
+        for server in self.servers:
+            socket = TSocket(
+                host=server["host"], port=server["port"], socket_timeout=self.timeout
+            )
+            transport = self._transport_class(socket)
+            protocol = self._protocol_class(transport, decode_response=False)
+            client = TClient(Hbase, protocol)
+
+            subconnection = Subconnection(
+                server=server, transport=transport, client=client, status=0
+            )
+            self.subconnections.append(subconnection)
+
+        self.client = HAClient(self.subconnections)
 
     def _table_name(self, name):
         """Construct a table name by optionally adding a table name prefix."""
@@ -169,28 +241,43 @@ class Connection(object):
 
         This method opens the underlying Thrift transport (TCP connection).
         """
-        if self.transport.is_open():
-            return
+        for subconn in self.subconnections:
+            if not subconn.transport.is_open():
+                logger.debug(
+                    "Opening Thrift transport to %s:%d",
+                    subconn.server["host"],
+                    subconn.server["port"],
+                )
+                try:
+                    subconn.transport.open()
+                    subconn.status = 1
+                except (TException, socket.error):
+                    logger.warning(
+                        "Connect to %s:%d failed",
+                        subconn.server["host"],
+                        subconn.server["port"],
+                    )
 
-        logger.debug("Opening Thrift transport to %s:%d", self.host, self.port)
-        self.transport.open()
+        if sum([subconn.status for subconn in self.subconnections]) == 0:
+            raise Exception("Failed to connect to any of thrift servers")
 
     def close(self):
         """Close the underyling transport to the HBase instance.
 
         This method closes the underlying Thrift transport (TCP connection).
         """
-        if not self.transport.is_open():
-            return
-
-        if logger is not None:
-            # If called from __del__(), module variables may no longer
-            # exist.
-            logger.debug(
-                "Closing Thrift transport to %s:%d",
-                self.host, self.port)
-
-        self.transport.close()
+        for subconn in self.subconnections:
+            if subconn.transport.is_open():
+                if logger is not None:
+                    # If called from __del__(), module variables may no longer
+                    # exist.
+                    logger.debug(
+                        "Closing Thrift transport to %s:%d",
+                        subconn.server["host"],
+                        subconn.server["port"],
+                    )
+                subconn.transport.close()
+                subconn.status = 0
 
     def __del__(self):
         try:
@@ -243,7 +330,7 @@ class Connection(object):
 
         # Filter using prefix, and strip prefix from names
         if self.table_prefix is not None:
-            prefix = self._table_name(b'')
+            prefix = self._table_name(b"")
             offset = len(prefix)
             names = [n[offset:] for n in names if n.startswith(prefix)]
 
@@ -288,8 +375,8 @@ class Connection(object):
 
         if not families:
             raise ValueError(
-                "Cannot create table %r (no column families specified)"
-                % name)
+                "Cannot create table %r (no column families specified)" % name
+            )
 
         column_descriptors = []
         for cf_name, options in six.iteritems(families):
@@ -300,9 +387,9 @@ class Connection(object):
             for option_name, value in six.iteritems(options):
                 kwargs[pep8_to_camel_case(option_name)] = value
 
-            if not cf_name.endswith(':'):
-                cf_name += ':'
-            kwargs['name'] = cf_name
+            if not cf_name.endswith(":"):
+                cf_name += ":"
+            kwargs["name"] = cf_name
 
             column_descriptors.append(ColumnDescriptor(**kwargs))
 
