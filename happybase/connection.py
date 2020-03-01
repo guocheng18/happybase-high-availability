@@ -12,7 +12,8 @@ import time
 import six
 from thriftpy2.protocol import TBinaryProtocol, TCompactProtocol
 from thriftpy2.thrift import TClient, TException
-from thriftpy2.transport import TBufferedTransport, TFramedTransport, TSocket
+from thriftpy2.transport import (
+    TBufferedTransport, TFramedTransport, TSocket, TTransportException)
 
 from Hbase_thrift import ColumnDescriptor, Hbase
 
@@ -32,6 +33,7 @@ DEFAULT_PORT = 9090
 DEFAULT_TRANSPORT = "buffered"
 DEFAULT_COMPAT = "0.98"
 DEFAULT_PROTOCOL = "binary"
+DEFAULT_RECOVERY_DELAY = 60  # seconds
 
 
 class HAClient(object):
@@ -47,17 +49,23 @@ class HAClient(object):
             failed = True
             while failed:
                 if self.subconnections[self.id].status:
+                    host = self.subconnections[self.id].server["host"]
+                    port = self.subconnections[self.id].server["port"]
+
                     result = None
                     try:
                         result = getattr(self.subconnections[self.id].client, _api)(
                             *args, **kwargs
                         )
                         failed = False
-                    except (TException, socket.error):
                         logger.debug(
-                            "Send request to %s:%d failed, trying other servers",
-                            self.subconnections[self.id].server["host"],
-                            self.subconnections[self.id].server["port"],
+                            "Send request [%s] to %s:%d successfully", _api, host, port
+                        )
+
+                    except (TTransportException, socket.error):
+                        logger.debug(
+                            "Send request [%s] to %s:%d failed, trying other servers",
+                            _api, host, port,
                         )
                         self.subconnections[self.id].transport.close()
                         self.subconnections[self.id].status = 0
@@ -66,7 +74,9 @@ class HAClient(object):
                 if failed:
                     fails += 1
                     if fails == len(self.subconnections):
-                        raise Exception("Request to all thrift servers failed!")
+                        raise TTransportException(
+                            message="Send request [%s] to any of thrift servers failed!" % _api
+                        )
             return result
 
         return _api_func
@@ -83,13 +93,17 @@ class Subconnection(object):
 
 
 class Connection(object):
-    """Connection to an HBase Thrift server.
+    """Connection to one or more HBase Thrift servers.
 
     The `host` and `port` arguments specify the host name and TCP port
     of the HBase Thrift server to connect to. If omitted or ``None``,
     a connection to the default port on ``localhost`` is made. If
     specified, the `timeout` argument specifies the socket timeout in
     milliseconds.
+
+    If `servers` is not None, the `host` and `port` arguments will be
+    ignored. And if more than one server address is given in `servers`,
+    the connection to thrift servers is high available.
 
     If `autoconnect` is `True` (the default) the connection is made
     directly, otherwise :py:meth:`Connection.open` must be called
@@ -129,6 +143,9 @@ class Connection(object):
     process as well. ``TBinaryProtocol`` is the default protocol that
     Happybase uses.
 
+    The optional `recovery_delay` argument specifies the delay that the
+    daemon thread executes the recovery of failed connections.
+
     .. versionadded:: 0.9
        `protocol` argument
 
@@ -144,13 +161,14 @@ class Connection(object):
     :param str host: The host to connect to
     :param int port: The port to connect to
     :param list servers: All thrift servers to enable HA, this will ignore 
-        the host and port params (optional)
+        the `host` and `port` arguments (optional)
     :param int timeout: The socket timeout in milliseconds (optional)
     :param bool autoconnect: Whether the connection should be opened directly
     :param str table_prefix: Prefix used to construct table names (optional)
     :param str table_prefix_separator: Separator used for `table_prefix`
     :param str compat: Compatibility mode (optional)
     :param str transport: Thrift transport mode (optional)
+    :param int recovery_delay: Seconds delay to execute recovery (optional)
     """
 
     def __init__(
@@ -165,6 +183,7 @@ class Connection(object):
         compat=DEFAULT_COMPAT,
         transport=DEFAULT_TRANSPORT,
         protocol=DEFAULT_PROTOCOL,
+        recovery_delay=DEFAULT_RECOVERY_DELAY,
     ):
 
         if transport not in THRIFT_TRANSPORTS:
@@ -208,7 +227,7 @@ class Connection(object):
         self._refresh_thrift_client()
 
         self.recovery_thread = threading.Thread(
-            target=self._recover_failed_connections, daemon=True
+            target=self._recover_failed_connections, args=(recovery_delay,), daemon=True
         )
 
         if autoconnect:
@@ -242,25 +261,20 @@ class Connection(object):
             return name
         return self.table_prefix + self.table_prefix_separator + name
 
-    def _recover_failed_connections(self, delay=60):
+    def _recover_failed_connections(self, delay):
         """ Try to reopen failed connections every specified seconds """
         while True:
             for subconn in self.subconnections:
+                host = subconn.server["host"]
+                port = subconn.server["port"]
+
                 if subconn.status == 0:
                     try:
                         subconn.transport.open()
                         subconn.status = 1
-                        logger.debug(
-                            "Connection to %s:%d recovered",
-                            subconn.server["host"],
-                            subconn.server["port"],
-                        )
+                        logger.debug("Connection to %s:%d recovered", host, port)
                     except (TException, socket.error):
-                        logger.debug(
-                            "Recover connection to %s:%d failed",
-                            subconn.server["host"],
-                            subconn.server["port"],
-                        )
+                        logger.debug("Recover connection to %s:%d failed", host, port)
             time.sleep(delay)
 
     def open(self):
@@ -269,24 +283,21 @@ class Connection(object):
         This method opens the underlying Thrift transport (TCP connection).
         """
         for subconn in self.subconnections:
+            host = subconn.server["host"]
+            port = subconn.server["port"]
+
             if not subconn.transport.is_open():
-                logger.debug(
-                    "Opening Thrift transport to %s:%d",
-                    subconn.server["host"],
-                    subconn.server["port"],
-                )
+                logger.debug("Opening Thrift transport to %s:%d", host, port)
                 try:
                     subconn.transport.open()
                     subconn.status = 1
                 except (TException, socket.error):
-                    logger.warning(
-                        "Connect to %s:%d failed",
-                        subconn.server["host"],
-                        subconn.server["port"],
-                    )
+                    logger.warning("Connect to %s:%d failed", host, port)
 
         if sum([subconn.status for subconn in self.subconnections]) == 0:
-            raise Exception("Failed to connect to any of thrift servers")
+            raise TTransportException(
+                message="Failed to connect to any of thrift servers"
+            )
 
         # Recovery
         if not self.recovery_thread.is_alive():
