@@ -4,9 +4,9 @@ HappyBase with High Availability
 HappyBase_ is a developer-friendly Python library to interact with Apache
 HBase. However it limits the connection to only one Thrift Server, which 
 may cause serious problems when the server is down. To solve it, this repo
-extends HappBase with high availability, i.e. switching connection to other
-live Thrift Servers when current is down and periodically recovering failed
-connections.
+implements high available connection for HappyBase, i.e. switching connection 
+to other live Thrift Servers when the currently connected is down and 
+periodically recovering failed connections.
 
 The only changed api is ``happybase.Connection`` with two arguments added:
 
